@@ -23,7 +23,7 @@ except:
     from Crypto.Cipher import AES # https://www.dlitz.net/software/pycrypto/
 
 
-__version__ = '0.9.925'
+__version__ = '0.9.921'
 
 module_logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ class iOSbackup(object):
 
     platformFoldersHint = {
         'darwin': '~/Library/Application Support/MobileSync/Backup',
-        'win32': r'%APPDATA%\Apple Computer\MobileSync\Backup'
+        'win32': r'%HOME%\Apple Computer\MobileSync\Backup'
     }
 
     catalog = {
@@ -137,7 +137,7 @@ class iOSbackup(object):
 
     def close(self):
         try:
-            if self.manifestDB is not None and self.decryptionKey:
+            if self.manifestDB is not None:
                 os.remove(self.manifestDB)
         except FileNotFoundError:
             # Its OK if manifest temporary file is not there anymore
@@ -270,7 +270,7 @@ class iOSbackup(object):
             Full path of folder that contains device backups. Uses platformFoldersHint if omitted.
         """
 
-        if path is not None:
+        if path:
             self.backupRoot=os.path.expanduser(os.path.expandvars(path))
         else:
             self.backupRoot=iOSbackup.getHintedBackupRoot()
@@ -400,7 +400,7 @@ class iOSbackup(object):
         catalog = sqlite3.connect(self.manifestDB)
         catalog.row_factory=sqlite3.Row
 
-        backupFiles = catalog.cursor().execute(f"SELECT * FROM Files ORDER BY domain,relativePath").fetchall()
+        backupFiles = catalog.cursor().execute(f"SELECT * FROM Files ORDER BY fileID").fetchall()
 
         list=[]
         for f in backupFiles:
@@ -654,9 +654,11 @@ class iOSbackup(object):
         backupFiles = catalog.cursor().execute(query).fetchall()
 
         fileList=[]
+
         for payload in backupFiles:
             payload=dict(payload)
-            payload['manifest']=NSKeyedUnArchiver.unserializeNSKeyedArchiver(payload['file'])
+#             payload['manifest']=biplist.readPlistFromString(payload['file'])
+            payload['manifest']=plistlib.loads(payload['file'])
             del payload['file']
 
             # Compute target file with path
@@ -741,6 +743,8 @@ class iOSbackup(object):
 
         if backupFile:
             payload=dict(backupFile)
+#             payload['manifest']=biplist.readPlistFromString(payload['file'])
+#             payload['manifest']=plistlib.loads(payload['file'])
             payload['manifest']=NSKeyedUnArchiver.unserializeNSKeyedArchiver(payload['file'])
             del payload['file']
         else:
@@ -764,19 +768,17 @@ class iOSbackup(object):
             manifest=manifestData
         elif type(manifestData)==bytes:
             # Interpret data stream and convert into a dict
+#             manifest = biplist.readPlistFromString(manifestData)
+#             manifest = plistlib.loads(manifestData)
             manifest = NSKeyedUnArchiver.unserializeNSKeyedArchiver(manifestData)
 
 
-        if "$version" in manifest:
-            if manifest["$version"] == 100000:
-                fileData = manifest["$objects"][1]
-        else:
-            fileData=manifest
 
+        fileData=manifest
 
-        # folder=True
-        # if 'EncryptionKey' in fileData:
-        #     folder=False
+        folder=True
+        if 'EncryptionKey' in fileData:
+            folder=False
 
         return {
             "size": fileData['Size'],
@@ -784,7 +786,7 @@ class iOSbackup(object):
             "lastModified": iOSbackup.convertTime(fileData['LastModified'], since2001=False),
             "lastStatusChange": iOSbackup.convertTime(fileData['LastStatusChange'], since2001=False),
             "mode": fileData['Mode'],
-            "isFolder": True if fileData['Size'] == 0 and 'EncryptionKey' not in fileData else False,
+            "isFolder": folder,
             "userID": fileData['UserID'],
             "inode": fileData['InodeNumber'],
             "completeManifest": manifest
@@ -939,7 +941,7 @@ class iOSbackup(object):
 
 
         if manifestEntry:
-            # print(manifestEntry)
+#             print(manifestEntry)
             info=iOSbackup.getFileInfo(manifestEntry['manifest'])
             fileNameHash=manifestEntry['fileID']
             domain=manifestEntry['domain']
@@ -968,7 +970,6 @@ class iOSbackup(object):
 
 
         if 'EncryptionKey' in fileData:
-            # Encrypted file
             encryptionKey=fileData['EncryptionKey'][4:]
             key = self.unwrapKeyForClass(fileData['ProtectionClass'], encryptionKey)
 
@@ -978,7 +979,6 @@ class iOSbackup(object):
 
             chunkIndex=0
             bytesWritten=0
-            decryptedChunk=None
             finalByteWritten=None
 
             # {BACKUP_ROOT}/{UDID}/ae/ae2c3d4e5f6...
@@ -994,58 +994,116 @@ class iOSbackup(object):
                         if len(chunk) == 0:
                             break
 
-                        decryptedChunk = decryptor.decrypt(chunk)
-                        outFile.write(decryptedChunk)
+                        decrypted_chunk = decryptor.decrypt(chunk)
+                        outFile.write(decrypted_chunk)
 
                         chunkIndex+=1
-                        bytesWritten+=len(decryptedChunk)
-                        finalByteWritten=decryptedChunk[-1]
-
-                    def hasAesPadding(expectedPaddingSize):
-                        """Checks the content of the last N bytes, which should be filled with 'N' repeating"""
-                        if finalByteWritten != expectedPaddingSize:
-                            return False
-
-                        # Checks each byte by counting occurrences
-                        potentialPadding = decryptedChunk[-finalByteWritten:]
-                        return potentialPadding.count(finalByteWritten) == finalByteWritten
+                        bytesWritten+=len(decrypted_chunk)
+                        finalByteWritten=decrypted_chunk[-1]
 
                     # Compare file sizes across 1) Manifest.db record, 2) original file, and 3) decrypted output
                     # (decrypted output sometimes adds RFC 1423 padding, aligning data on a 16-byte boundary)
                     originalSize=os.path.getsize(os.path.join(self.backupRoot, self.udid, fileNameHash[:2], fileNameHash))
                     if bytesWritten - info['size'] > 16:
+                        # For more than 16 bytes appended, freak out and do a bunch of logging
+                        #if originalSize != bytesWritten:
+                        #    print(f"[WARN] Decrypted file size exceeds reported by {bytesWritten - info['size']} bytes\n"
+                        #          f"       - file:      {targetFileName}\n"
+                        #          f"       - encrypted: {originalSize}\n"
+                        #          f"       - decrypted: {bytesWritten}\n"
+                        #          f"       - reported:  {info['size']}")
+                        #else:
+                        #    print(f"[WARN] Decrypted file size exceeds reported by {bytesWritten - info['size']} bytes\n"
+                        #          f"       - file:      {targetFileName}\n"
+                        #          f"       - encrypted: {originalSize} / decrypted: {bytesWritten}\n"
+                        #          f"       - reported:  {info['size']}")
+                        module_logger.warning(
+                            f"{domain} /\n"
+                            f"{relativePath}\n"
+                            f"    actual {info['size']:9_} / expected {bytesWritten:9_}\n"
+                        )
+
                         # Check if we have a final encryption pass of 16 bytes appended, for some reason
-                        if hasAesPadding(16):
+                        if finalByteWritten == 16:
+                            assert decrypted_chunk[-1] == 16
+                            assert decrypted_chunk[-2] == 16
+                            assert decrypted_chunk[-3] == 16
+                            assert decrypted_chunk[-4] == 16
+                            assert decrypted_chunk[-5] == 16
+                            assert decrypted_chunk[-6] == 16
+                            assert decrypted_chunk[-7] == 16
+                            assert decrypted_chunk[-8] == 16
+                            assert decrypted_chunk[-9] == 16
+                            assert decrypted_chunk[-10] == 16
+                            assert decrypted_chunk[-11] == 16
+                            assert decrypted_chunk[-12] == 16
+                            assert decrypted_chunk[-13] == 16
+                            assert decrypted_chunk[-14] == 16
+                            assert decrypted_chunk[-15] == 16
+                            assert decrypted_chunk[-16] == 16
+                            #print(f"       - [DEBUG]    Removing trailing 16 bytes of AES padding")
+                            #print()
                             outFile.truncate(bytesWritten - finalByteWritten)
+                        else:
+                            print(f"[WARN] Found a wrongly-sized file with weird padding, you should flip out: final byte = {finalByteWritten}")
 
                     if bytesWritten - info['size'] == 16:
-                        if hasAesPadding(16):
-                            outFile.truncate(bytesWritten - 16)
+                        # TODO: Merge this cleanly into the above case
+                        assert finalByteWritten == 16
+                        #print(f"[INFO] Decrypted file size exceeds reported by exactly 16 bytes, {targetFileName}:")
+                        outFile.truncate(bytesWritten - 16)
 
                     if bytesWritten - info['size'] < 16 and bytesWritten - info['size'] > 0:
                         # This is the "normal" case, where we added a few bytes of extra padding
-                        if hasAesPadding(bytesWritten - info['size']):
-                            outFile.truncate(bytesWritten - finalByteWritten)
+                        #print(f"[WARN] Final byte says padding is {finalByteWritten} bytes, file size % 16 = {bytesWritten % 16}, removing that many bytes from end of file")
+                        outFile.truncate(bytesWritten - finalByteWritten)
 
                     if bytesWritten - info['size'] < 0:
                         # For an over-reported size, do nothing because we can't conjure data from nowhere
-                        # Still, check if the last 16 bytes looks like padding
-                        if hasAesPadding(16):
+                        #print(f"[WARN] Decrypted file size is much smaller than reported by {bytesWritten - info['size']} bytes\n"
+                        #      f"       - file:      {targetFileName}\n"
+                        #      f"         domain: \"{domain}\" / name: {relativePath} \n"
+                        #      f"       - encrypted: {originalSize}\n"
+                        #      f"       - decrypted: {bytesWritten}\n"
+                        #      f"       - reported:  {info['size']}")
+                        module_logger.warning(
+                            f"{domain} /\n"
+                            f"{relativePath}\n"
+                            f"    actual {info['size']:9_} / expected {bytesWritten:9_}\n"
+                        )
+
+                        # Still, check if the last 16 bytes look like padding
+                        if finalByteWritten < 16:
+                            print(f"[WARN] Found a wrongly-sized file with weird padding, you should flip out: final byte = {finalByteWritten}")
+
+                        elif finalByteWritten == 16:
+                            assert decrypted_chunk[-1] == 16
+                            assert decrypted_chunk[-2] == 16
+                            assert decrypted_chunk[-3] == 16
+                            assert decrypted_chunk[-4] == 16
+                            assert decrypted_chunk[-5] == 16
+                            assert decrypted_chunk[-6] == 16
+                            assert decrypted_chunk[-7] == 16
+                            assert decrypted_chunk[-8] == 16
+                            assert decrypted_chunk[-9] == 16
+                            assert decrypted_chunk[-10] == 16
+                            assert decrypted_chunk[-11] == 16
+                            assert decrypted_chunk[-12] == 16
+                            assert decrypted_chunk[-13] == 16
+                            assert decrypted_chunk[-14] == 16
+                            assert decrypted_chunk[-15] == 16
+                            assert decrypted_chunk[-16] == 16
+                            #print(f"       - [DEBUG]    Removing trailing 16 bytes of AES padding")
+                            #print()
                             outFile.truncate(bytesWritten - finalByteWritten)
 
-        elif info['isFolder']:
-            # Plain folder
-            Path(targetFileName).mkdir(parents=True, exist_ok=True)
-        else:
-            # Case for decrypted file: simply copy and rename
-            import shutil
+                        elif finalByteWritten > 16:
+                            print(f"[WARN] Found a wrongly-sized file with weird padding, you should flip out: final byte = {finalByteWritten}")
 
-            shutil.copyfile(
-                # {BACKUP_ROOT}/{UDID}/ae/ae2c3d4e5f6...
-                src=os.path.join(self.backupRoot, self.udid, fileNameHash[:2], fileNameHash),
-                dst=targetFileName,
-                follow_symlinks=True
-            )
+        elif info['isFolder']:
+            Path(targetFileName).mkdir(parents=True, exist_ok=True)
+
+
 
 
         # Set file modification date and localtime time as per device's
@@ -1089,9 +1147,6 @@ class iOSbackup(object):
 
     def getManifestDB(self):
         """Returns full path name of a decrypted copy of Manifest.db. Used internally."""
-        if not self.decryptionKey:
-            self.manifestDB = os.path.join(self.backupRoot,self.udid,iOSbackup.catalog['manifestDB'])
-            return
 
         with open(os.path.join(self.backupRoot,self.udid,iOSbackup.catalog['manifestDB']), 'rb') as db:
             encrypted_db = db.read()
@@ -1202,8 +1257,6 @@ class iOSbackup(object):
 
 
     def unlockKeys(self):
-        if not self.decryptionKey:
-            return True
         for classkey in self.classKeys.values():
             if b"WPKY" not in classkey:
                 continue
@@ -1215,6 +1268,7 @@ class iOSbackup(object):
                     raise Exception('Failed decrypting backup. Try to start over with a clear text decrypting password on parameter "cleartextpassword".')
 
                 classkey[b"KEY"] = k
+                # print(f'Unlocked key {classkey[b"CLAS"]}: {classkey[b"WPKY"].hex()} => {k.hex()}')
 
         return True
 
@@ -1245,6 +1299,8 @@ class iOSbackup(object):
 
 
     def AESUnwrap(kek=None, wrapped=None):
+        #print(f'AESUnwrap({kek.hex()}, {wrapped.hex()})')
+
         key=kek
 
         C = []
