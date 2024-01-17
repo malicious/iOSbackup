@@ -1110,6 +1110,22 @@ class iOSbackup(object):
         mtime=time.mktime(info['lastModified'].astimezone(tz=None).timetuple())
         os.utime(targetFileName,(mtime, mtime))
 
+        # 2024-ww03.3-Jan-17 18:46:08.609
+        # set it more thoroughly
+        created_dt = datetime.fromtimestamp(fileData['Birth'])
+        last_modified_dt = datetime.fromtimestamp(fileData['LastModified'])
+        last_status_change_dt = datetime.fromtimestamp(fileData['LastStatusChange'])
+        # times is a tuple (atime, mtime)
+        os.utime(targetFileName, (last_status_change_dt.timestamp(), last_modified_dt.timestamp()))
+        # and the real call, NB this suffers from the Year 2038 bug
+        from subprocess import check_call
+        check_call([
+            'SetFile',
+            '-d', created_dt.strftime('%m/%d/%Y %H:%M:%S'),
+            '-m', last_modified_dt.strftime('%m/%d/%Y %H:%M:%S'),
+            targetFileName,
+        ])
+
         # Add more information to the returned info dict
         info['decryptedFilePath']=targetFileName
 
